@@ -24,6 +24,9 @@ const RETRIES = process.env.NODE_ENV === "test" ? 7 : PATs;
  * @param {number} retries How many times to retry.
  * @returns {Promise<any>} The response from the fetcher function.
  */
+const isRetryableStatus = (status) =>
+  status === 403 || status === 429 || status >= 500;
+
 const retryer = async (fetcher, variables, retries = 0) => {
   if (!RETRIES) {
     throw new CustomError("No GitHub API tokens found", CustomError.NO_TOKENS);
@@ -31,64 +34,51 @@ const retryer = async (fetcher, variables, retries = 0) => {
 
   if (retries > RETRIES) {
     throw new CustomError(
-      "Downtime due to GitHub API rate limiting",
+      "GitHub API temporarily unavailable",
       CustomError.MAX_RETRY,
     );
   }
 
   try {
-    // try to fetch with the first token since RETRIES is 0 index i'm adding +1
-    let response = await fetcher(
+    const response = await fetcher(
       variables,
       // @ts-ignore
       process.env[`PAT_${retries + 1}`],
-      // used in tests for faking rate limit
       retries,
     );
 
-    // react on both type and message-based rate-limit signals.
-    // https://github.com/anuraghazra/github-readme-stats/issues/4425
     const errors = response?.data?.errors;
     const errorType = errors?.[0]?.type;
     const errorMsg = errors?.[0]?.message || "";
     const isRateLimited =
-      (errors && errorType === "RATE_LIMITED") || /rate limit/i.test(errorMsg);
+      errorType === "RATE_LIMITED" || /rate limit/i.test(errorMsg);
+    const isRetryable =
+      isRateLimited || isRetryableStatus(response?.status || 0);
 
-    // if rate limit is hit increase the RETRIES and recursively call the retryer
-    // with username, and current RETRIES
-    if (isRateLimited) {
+    if (isRetryable) {
       logger.log(`PAT_${retries + 1} Failed`);
-      retries++;
-      // directly return from the function
-      return retryer(fetcher, variables, retries);
+      return retryer(fetcher, variables, retries + 1);
     }
 
-    // finally return the response
     return response;
   } catch (err) {
     /** @type {any} */
     const e = err;
-
-    // network/unexpected error → let caller treat as failure
     if (!e?.response) {
       throw e;
     }
 
-    // prettier-ignore
-    // also checking for bad credentials if any tokens gets invalidated
-    const isBadCredential =
-      e?.response?.data?.message === "Bad credentials";
-    const isAccountSuspended =
-      e?.response?.data?.message === "Sorry. Your account was suspended.";
+    const status = e.response.status || 0;
+    const message = e.response.data?.message;
+    const isInvalidToken =
+      message === "Bad credentials" ||
+      message === "Sorry. Your account was suspended.";
 
-    if (isBadCredential || isAccountSuspended) {
+    if (isInvalidToken || isRetryableStatus(status)) {
       logger.log(`PAT_${retries + 1} Failed`);
-      retries++;
-      // directly return from the function
-      return retryer(fetcher, variables, retries);
+      return retryer(fetcher, variables, retries + 1);
     }
 
-    // HTTP error with a response → return it for caller-side handling
     return e.response;
   }
 };
